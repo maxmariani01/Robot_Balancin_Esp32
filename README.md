@@ -31,7 +31,7 @@ El ESP32-C3 y el MPU6050 deben trabajar a 3.3 V. El L298N necesita alimentacion 
 
 ## Ajustes importantes
 
-Los parametros estan al inicio de `src/main.cpp`, dentro de `namespace Config`.
+Los parametros estan en `include/Config.h`, dentro de `namespace Config`.
 
 - `BALANCE_ANGLE_DEG`: angulo real de equilibrio. El valor inicial `-4.7` equivale aproximadamente al `175.3` del sketch original.
 - `KP`, `KI`, `KD`: constantes del PID.
@@ -53,3 +53,14 @@ Compilacion esperada:
 ```
 
 En esta maquina el `pio` correcto es el del entorno de PlatformIO en `/home/maximomariani/.platformio/penv/bin/pio`. El `/usr/bin/pio` del sistema falla por una instalacion vieja incompatible con Python 3.12.
+
+## Test L298N
+
+El directorio `Test_L298N_Motores_Esp32C3` contiene un firmware independiente para probar el puente H L298N y los motores sin usar el MPU6050 ni el lazo de balance.
+
+Para compilarlo:
+
+```sh
+cd Test_L298N_Motores_Esp32C3
+/home/maximomariani/.platformio/penv/bin/pio run
+```
