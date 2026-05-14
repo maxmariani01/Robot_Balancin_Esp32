@@ -17,9 +17,21 @@ Usa los mismos pines del proyecto del robot:
 
 Conectar GND del ESP32-C3 y GND del L298N juntos. La alimentacion de motores debe ser externa al ESP32.
 
+## Control web
+
+Al arrancar, la placa crea una red WiFi propia:
+
+| Dato | Valor |
+| --- | --- |
+| SSID | `RobotTest` |
+| Clave | `12345678` |
+| URL | `http://192.168.4.1` |
+
+Conectarse a esa red desde el celular o la PC y abrir la URL en el navegador. La pagina permite mover ambos motores adelante/atras, mover solo izquierdo/derecho, parar y ajustar el PWM.
+
 ## Comandos por monitor serie
 
-Abrir monitor a `115200`.
+El monitor serie sigue disponible como respaldo de diagnostico. Abrir monitor a `115200`.
 
 | Comando | Accion |
 | --- | --- |
@@ -29,7 +41,6 @@ Abrir monitor a `115200`.
 | `b` | ambos motores atras durante 2 s |
 | `l` | motor izquierdo adelante durante 2 s |
 | `r` | motor derecho adelante durante 2 s |
-| `a` | secuencia automatica corta |
 | `+` | subir PWM |
 | `-` | bajar PWM |
 | `0`..`9` | ajustar PWM en pasos aproximados |
@@ -37,11 +48,11 @@ Abrir monitor a `115200`.
 ## Compilar
 
 ```sh
-/home/maximomariani/.platformio/penv/bin/pio run
+pio run
 ```
 
 ## Cargar
 
 ```sh
-/home/maximomariani/.platformio/penv/bin/pio run -t upload
+pio run -t upload
 ```
