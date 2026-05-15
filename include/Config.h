@@ -28,11 +28,11 @@ namespace Config {
 //   Si "zumba" / vibra:         bajar KI   o bajar KD.
 //
 //   Nota: con derivada sobre la medicion, KD pesa distinto que en PID clasico.
-//   Empezar con KD bajo (1.0 - 2.0) y subir de a poco.
+//   Estos valores son conservadores para ajustar con movimientos cortos.
 
-constexpr float KP = 60.0f;
-constexpr float KI = 270.0f;
-constexpr float KD = 2.4f;
+constexpr float KP = 25.0f;
+constexpr float KI = 0.0f;
+constexpr float KD = 5.5f;
 
 // ----------------------------------------------------------------------------
 // 2. [AJUSTAR] Punto de equilibrio
@@ -41,7 +41,7 @@ constexpr float KD = 2.4f;
 //   Para calibrarlo: cargar el firmware, mantener el robot en pie sin armar,
 //   y leer el "Pitch:" que sale por serial. Ese valor va aca.
 
-constexpr float BALANCE_ANGLE_DEG = -4.7f;
+constexpr float BALANCE_ANGLE_DEG = 4.5f;
 
 // ----------------------------------------------------------------------------
 // 3. [AJUSTAR] Ventanas de armado / caida
@@ -74,17 +74,17 @@ constexpr float RIGHT_SPEED_FACTOR = 0.60f;
 // ----------------------------------------------------------------------------
 // 5. [AJUSTAR] Inversiones
 // ----------------------------------------------------------------------------
-//   Si el robot corrige al lado equivocado, probar invertir UN flag a la vez.
+//   La salida global queda invertida por defecto para este cableado.
+//   Si el pitch queda con signo contrario, ajustar INVERT_PITCH.
 //
 //   INVERT_PITCH:          la IMU esta montada al reves -> invierte el angulo.
-//   INVERT_MOTOR_OUTPUT:   invierte el sentido global del comando PWM
-//                          (cuando el PID empuja al lado contrario).
+//   INVERT_MOTOR_OUTPUT:   invierte el sentido global del comando PWM.
 //   INVERT_LEFT_MOTOR:     invierte el sentido de la rueda izquierda
 //                          (util si cableaste IN1/IN2 al reves).
 //   INVERT_RIGHT_MOTOR:    idem para la derecha.
 
 constexpr bool INVERT_PITCH = false;
-constexpr bool INVERT_MOTOR_OUTPUT = false;
+constexpr bool INVERT_MOTOR_OUTPUT = true;
 constexpr bool INVERT_LEFT_MOTOR = false;
 constexpr bool INVERT_RIGHT_MOTOR = false;
 
@@ -116,6 +116,7 @@ constexpr uint8_t MPU_INT_PIN = 2;
 // Lazo de control:
 constexpr uint32_t CONTROL_PERIOD_US = 5000;   // 200 Hz.
 constexpr uint32_t DEBUG_PERIOD_MS = 100;
+constexpr uint32_t MPU_RETRY_PERIOD_MS = 2000;
 constexpr bool USE_MPU_INTERRUPT = false;      // Hoy el loop usa polling.
 
 // Filtro complementario (0..1; mas alto = mas peso al gyro, menos al accel):
@@ -130,5 +131,14 @@ constexpr uint8_t RIGHT_PWM_CHANNEL = 1;
 constexpr uint32_t PWM_FREQUENCY_HZ = 20000;
 constexpr uint8_t PWM_RESOLUTION_BITS = 8;
 constexpr int PWM_MAX = (1 << PWM_RESOLUTION_BITS) - 1;
+
+// WiFi AP para ajustar el robot desde el navegador:
+constexpr char WIFI_AP_SSID[] = "RobotBalancin";
+constexpr char WIFI_AP_PASSWORD[] = "12345678";
+constexpr uint8_t WIFI_AP_CHANNEL = 1;
+
+// LED integrado de estado:
+constexpr bool STATUS_LED_ENABLED = true;
+constexpr uint8_t STATUS_LED_BRIGHTNESS = 24; // 0..255
 
 } // namespace Config
