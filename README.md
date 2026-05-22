@@ -10,6 +10,13 @@ Proyecto Arduino/PlatformIO para un robot balancin con ESP32-C3 DevKitC-02, MPU6
 - Se reemplazo `PID_v1` por un PID simple con anti-windup.
 - Se eliminaron dependencias de `I2Cdev` y DMP para que el sketch compile con el core Arduino ESP32 y `Wire`.
 - Se agregaron parada por caida, armado gradual y salida serie menos agresiva.
+- El lazo de balanceo corre en una task FreeRTOS dedicada (prioridad 2, 200 Hz por `vTaskDelayUntil`), separada de `loop()`, que solo atiende el servidor web. Asi una request HTTP no puede retrasar un ciclo de control. La task de control es la unica que toca el bus I2C y los motores; la web solo deja pedidos (calibrar / desarmar / guardar) con banderas.
+- Filtro complementario adaptativo: baja el peso del acelerometro cuando el modulo del vector aceleracion se aparta de 1 g (aceleracion lineal contamina la lectura).
+- PWM por LEDC a 10 bits con el duty calculado en punto flotante y compensacion de friccion lineal, en vez del escalon abrupto `MIN_ABS_SPEED`.
+- Ajustes persistentes en NVS y metricas de tuning (grafico en vivo, RMS del error).
+- Auto-trim del angulo de equilibrio: un integrador lento corre el setpoint efectivo hacia el verdadero punto de centro de masa, asi el robot deja de derivar (lo aprendido se ve en la web como "Auto-trim").
+- Re-calibracion del bias del gyro cuando el robot esta en reposo, para compensar el drift termico.
+- Filtro pasabajos sobre el termino derivativo (menos chatter de PWM) y gyro configurado a +/-500 dps para tener headroom y no saturar en correcciones rapidas.
 
 ## Pines por defecto
 
@@ -58,11 +65,18 @@ Al arrancar, el firmware principal crea una red WiFi propia:
 
 Desde esa pagina se pueden ajustar en caliente los valores de PID con sliders discretos, equilibrio/filtro del sensor, bias del gyro Y, PWM minimo, factor de PWM por rueda y trim PWM independiente para cada rueda. Tambien permite desarmar el control y recalibrar el giroscopio.
 
+Ayudas para tunear:
+
+- **Grafico en vivo del pitch:** muestra los ultimos ~6 s (canvas, datos servidos por `/samples`) para ver oscilacion, overshoot y settling de un vistazo.
+- **RMS del error de pitch:** metrica objetiva que se reinicia en cada armado; sirve para comparar ajustes ("el RMS bajo de 2.1 a 1.4").
+- **Boton "Guardar ajustes":** persiste KP/KI/KD y todo lo demas en NVS (flash). Se cargan al bootear, asi no hay que copiarlos a `Config.h` ni recompilar. Guardar desarma el robot (la escritura a flash congela la CPU unos ms). `Config.h` sigue siendo el default de fabrica si NVS esta vacio.
+- **Salida serie en formato Serial Plotter** del IDE de Arduino (`pitch:..,setpoint:..,rms:..`).
+
 La pagina muestra la direccion I2C y el `WHO_AM_I` del modulo. El firmware prueba `0x68` y `0x69`, y acepta IDs compatibles `0x68`, `0x69`, `0x70`, `0x71` y `0x73`.
 
-El LED integrado queda como indicador de arranque: azul mientras inicia, verde cuando detecto el MPU y calibro el gyro, amarillo si falta calibrar el gyro, rojo si no detecta el sensor o falla la lectura.
+El LED integrado funciona como indicador de estado: blanco mientras calibra el giroscopio, verde cuando el sensor esta calibrado y operando, rojo cuando detecta caida (o si no encuentra el sensor / falla la lectura). Si el MPU se recupera despues de una falla, queda en naranja como aviso de que falta recalibrar el gyro desde la web.
 
-Los cambios hechos desde la web son temporales: al reiniciar vuelven los defaults definidos en `include/Config.h`.
+Los cambios hechos desde la web son temporales salvo que se use "Guardar ajustes": sin guardar, al reiniciar vuelven los valores de NVS o, si NVS esta vacio, los defaults de `include/Config.h`.
 
 Compilacion esperada:
 

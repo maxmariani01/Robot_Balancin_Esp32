@@ -9,6 +9,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <math.h>
 
 #include "Config.h"
@@ -97,10 +98,9 @@ public:
         sumZ += gyroZ;
         ++validSamples;
       }
-      delayMicroseconds(Config::CONTROL_PERIOD_US);
-      if ((i & 0x1F) == 0) {
-        yield();
-      }
+      // delay() bloquea con vTaskDelay: cede CPU a IDLE y alimenta el
+      // watchdog mientras dura la calibracion (~6 s).
+      delay(Config::CONTROL_PERIOD_US / 1000);
     }
 
     if (validSamples < samples / 2) {
@@ -136,12 +136,38 @@ public:
     return atan2f(ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
   }
 
+  // Modulo del vector aceleracion en g. En reposo vale ~1.0; se aparta de 1.0
+  // cuando hay aceleracion lineal (el robot acelerando para corregirse).
+  float accelMagnitudeG() const {
+    const float ax = static_cast<float>(accelX);
+    const float ay = static_cast<float>(accelY);
+    const float az = static_cast<float>(accelZ);
+    return sqrtf(ax * ax + ay * ay + az * az) / ACCEL_LSB_PER_G;
+  }
+
   float gyroPitchRateDps() const {
     return (static_cast<float>(gyroY) - gyroBiasY) / GYRO_LSB_PER_DPS;
   }
 
   float temperatureC() const {
     return static_cast<float>(temperatureRaw) / 340.0f + 36.53f;
+  }
+
+  // True si los 3 ejes del gyro y el modulo del accel estan quietos: el robot
+  // no se esta moviendo ni lo estan sosteniendo (apoyado o caido y asentado).
+  bool looksAtRest() const {
+    const float gyroThreshLsb = REST_GYRO_THRESH_DPS * GYRO_LSB_PER_DPS;
+    if (fabsf(static_cast<float>(gyroX) - gyroBiasX) > gyroThreshLsb) return false;
+    if (fabsf(static_cast<float>(gyroY) - gyroBiasY) > gyroThreshLsb) return false;
+    if (fabsf(static_cast<float>(gyroZ) - gyroBiasZ) > gyroThreshLsb) return false;
+    return fabsf(accelMagnitudeG() - 1.0f) < REST_ACCEL_THRESH_G;
+  }
+
+  // EMA lento de los bias del gyro hacia la lectura cruda actual (usar en reposo).
+  void nudgeGyroBias(float k) {
+    gyroBiasX += (static_cast<float>(gyroX) - gyroBiasX) * k;
+    gyroBiasY += (static_cast<float>(gyroY) - gyroBiasY) * k;
+    gyroBiasZ += (static_cast<float>(gyroZ) - gyroBiasZ) * k;
   }
 
   int16_t accelX = 0;
@@ -156,7 +182,12 @@ public:
   float gyroBiasZ = 0.0f;
 
 private:
-  static constexpr float GYRO_LSB_PER_DPS = 131.0f;
+  static constexpr float GYRO_LSB_PER_DPS = 65.5f;    // +/-500 dps (headroom).
+  static constexpr float ACCEL_LSB_PER_G = 16384.0f;  // +/-2 g.
+
+  // Umbrales de "reposo" para la re-calibracion del bias del gyro.
+  static constexpr float REST_GYRO_THRESH_DPS = 2.0f;
+  static constexpr float REST_ACCEL_THRESH_G = 0.10f;
 
   static constexpr uint8_t SMPLRT_DIV = 0x19;
   static constexpr uint8_t CONFIG = 0x1A;
@@ -192,7 +223,7 @@ private:
 
     writeRegister(CONFIG, 0x03);       // DLPF ~44 Hz gyro / ~42 Hz accel.
     writeRegister(SMPLRT_DIV, 0x04);   // 1 kHz / (1 + 4) = 200 Hz.
-    writeRegister(GYRO_CONFIG, 0x00);  // +/-250 dps.
+    writeRegister(GYRO_CONFIG, 0x08);  // +/-500 dps (headroom anti-saturacion).
     writeRegister(ACCEL_CONFIG, 0x00); // +/-2 g.
     writeRegister(INT_ENABLE, Config::USE_MPU_INTERRUPT ? 0x01 : 0x00);
     readRaw();
@@ -265,7 +296,7 @@ public:
     if (!saturated || unsaturating) {
       integralTerm = candidateI;
     }
-    integralTerm = constrain(integralTerm, -maxOut, maxOut);
+    integralTerm = constrain(integralTerm, -Config::INTEGRAL_LIMIT, Config::INTEGRAL_LIMIT);
     return output;
   }
 
@@ -285,8 +316,8 @@ public:
     pinMode(Config::RIGHT_IN1_PIN, OUTPUT);
     pinMode(Config::RIGHT_IN2_PIN, OUTPUT);
 
-    ledcSetup(Config::LEFT_PWM_CHANNEL, Config::PWM_FREQUENCY_HZ, Config::PWM_RESOLUTION_BITS);
-    ledcSetup(Config::RIGHT_PWM_CHANNEL, Config::PWM_FREQUENCY_HZ, Config::PWM_RESOLUTION_BITS);
+    ledcSetup(Config::LEFT_PWM_CHANNEL, Config::PWM_FREQUENCY_HZ, Config::LEDC_RESOLUTION_BITS);
+    ledcSetup(Config::RIGHT_PWM_CHANNEL, Config::PWM_FREQUENCY_HZ, Config::LEDC_RESOLUTION_BITS);
     ledcAttachPin(Config::LEFT_PWM_PIN, Config::LEFT_PWM_CHANNEL);
     ledcAttachPin(Config::RIGHT_PWM_PIN, Config::RIGHT_PWM_CHANNEL);
     stop();
@@ -297,12 +328,15 @@ public:
       command = -command;
     }
 
-    const int pwm = constrain(static_cast<int>(lroundf(command)), -Config::PWM_MAX, Config::PWM_MAX);
+    // El comando se mantiene en punto flotante (unidades de control +/-PWM_MAX)
+    // hasta el ledcWrite final, asi no se pierde resolucion antes de tiempo.
+    const float maxOut = static_cast<float>(Config::PWM_MAX);
+    command = constrain(command, -maxOut, maxOut);
     driveOneMotor(
         Config::LEFT_IN1_PIN,
         Config::LEFT_IN2_PIN,
         Config::LEFT_PWM_CHANNEL,
-        pwm,
+        command,
         settings.leftSpeedFactor,
         settings.leftPwmTrim,
         settings.minAbsSpeed,
@@ -312,7 +346,7 @@ public:
         Config::RIGHT_IN1_PIN,
         Config::RIGHT_IN2_PIN,
         Config::RIGHT_PWM_CHANNEL,
-        pwm,
+        command,
         settings.rightSpeedFactor,
         settings.rightPwmTrim,
         settings.minAbsSpeed,
@@ -344,7 +378,7 @@ private:
       uint8_t in1,
       uint8_t in2,
       uint8_t pwmChannel,
-      int command,
+      float command,
       float factor,
       int trim,
       int minAbsSpeed,
@@ -354,19 +388,25 @@ private:
       command = -command;
     }
 
-    int duty = abs(command);
-    if (duty > 0 && duty < minAbsSpeed) {
-      duty = minAbsSpeed;
+    const float maxOut = static_cast<float>(Config::PWM_MAX);
+    const float magnitude = fabsf(command);
+    float controlDuty = 0.0f; // unidades de control 0..PWM_MAX
+
+    // Compensacion de friccion suave: en vez del escalon 0 -> MIN_ABS_SPEED,
+    // cualquier comando no nulo se mapea linealmente a [minAbsSpeed, PWM_MAX].
+    // Asi las correcciones finas del PID en el rango bajo si producen cambios
+    // de duty proporcionales (menos limit-cycle parado cerca del equilibrio).
+    if (magnitude > 0.5f) {
+      const float floorOut = static_cast<float>(minAbsSpeed);
+      controlDuty = floorOut + (magnitude / maxOut) * (maxOut - floorOut);
+      controlDuty = controlDuty * factor + static_cast<float>(trim);
+      controlDuty = constrain(controlDuty, 0.0f, maxOut);
     }
 
-    if (duty > 0) {
-      duty = constrain(static_cast<int>(lroundf(static_cast<float>(duty) * factor)) + trim, 0, Config::PWM_MAX);
-    }
-
-    if (command > 0) {
+    if (command > 0.5f) {
       digitalWrite(in1, HIGH);
       digitalWrite(in2, LOW);
-    } else if (command < 0) {
+    } else if (command < -0.5f) {
       digitalWrite(in1, LOW);
       digitalWrite(in2, HIGH);
     } else {
@@ -374,8 +414,12 @@ private:
       digitalWrite(in2, LOW);
     }
 
-    ledcWrite(pwmChannel, duty);
-    lastSignedPwm = command > 0 ? duty : (command < 0 ? -duty : 0);
+    // Se redondea una sola vez aca, ya escalado a la resolucion del LEDC.
+    const float ledcScale = static_cast<float>(Config::LEDC_MAX) / maxOut;
+    ledcWrite(pwmChannel, static_cast<uint32_t>(lroundf(controlDuty * ledcScale)));
+
+    const int reportedDuty = static_cast<int>(lroundf(controlDuty));
+    lastSignedPwm = command > 0.5f ? reportedDuty : (command < -0.5f ? -reportedDuty : 0);
   }
 
   int lastLeftPwm = 0;
@@ -391,11 +435,13 @@ BalancePid pid;
 L298MotorDriver motors;
 RuntimeSettings settings;
 WebServer server(80);
+Preferences prefs;
 
 volatile bool mpuDataReady = false;
 
 float pitchDeg = 0.0f;
-float pitchRateDps = 0.0f;
+float pitchRateDps = 0.0f;          // velocidad cruda del gyro (para status).
+float pitchRateFilteredDps = 0.0f;  // velocidad suavizada que alimenta el termino D.
 bool filterInitialized = false;
 bool mpuReady = false;
 bool gyroCalibrated = false;
@@ -403,10 +449,42 @@ bool gyroCalibrated = false;
 bool armed = false;
 uint32_t armStartMs = 0;
 
+// Auto-trim: correccion lenta del angulo de equilibrio. El setpoint efectivo
+// es balanceAngleDeg + autoTrimDeg.
+float autoTrimDeg = 0.0f;
+// Momento en que el robot empezo a estar quieto (0 = no esta en reposo).
+uint32_t restSinceMs = 0;
+
 uint32_t lastControlUs = 0;
 uint32_t lastDebugMs = 0;
 uint32_t lastMpuRetryMs = 0;
 float lastOutput = 0.0f;
+bool lastFallenLed = false;
+
+// Alpha efectivo del filtro complementario adaptativo (para debug/plotter).
+float lastFilterAlpha = Config::COMPLEMENTARY_ALPHA;
+
+// Metrica de calidad: RMS del error de pitch mientras esta armado. Es un
+// promedio movil exponencial del error al cuadrado; sqrt al mostrarlo.
+float pitchErrorMsAccum = 0.0f;
+float pitchRmsDeg = 0.0f;
+
+// Buffer circular de pitch para el grafico en vivo de la web (~50 Hz).
+constexpr uint16_t PITCH_SAMPLE_CAP = 300;
+float pitchSamples[PITCH_SAMPLE_CAP] = {0.0f};
+volatile uint16_t pitchSampleHead = 0;
+volatile uint16_t pitchSampleCount = 0;
+uint8_t pitchSampleDivider = 0;
+
+// Lazo de control en su propia task FreeRTOS, separada del servidor web.
+// Las banderas las setea la task del web server y las consume la de control,
+// para que el HTTP nunca demore un ciclo de balanceo ni toque motores / I2C.
+TaskHandle_t controlTaskHandle = nullptr;
+volatile bool calibrateRequested = false;
+volatile bool resetRequested = false;
+volatile bool saveRequested = false;
+volatile bool calibrating = false;
+volatile bool nvsHasSavedSettings = false;
 
 // ============================================================================
 //  LED integrado de estado
@@ -433,12 +511,20 @@ void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
 #endif
 }
 
-void setStatusLedBooting() {
-  setStatusLed(0, 0, 255);
+// Estados principales pedidos por el robot:
+//   blanco -> calibrando sensor
+//   verde  -> sensor calibrado y operando
+//   rojo   -> robot caido (o falla irrecuperable del MPU)
+void setStatusLedCalibrating() {
+  setStatusLed(255, 255, 255);
 }
 
-void setStatusLedOk() {
+void setStatusLedReady() {
   setStatusLed(0, 255, 0);
+}
+
+void setStatusLedFallen() {
+  setStatusLed(255, 0, 0);
 }
 
 void setStatusLedWarning() {
@@ -447,6 +533,65 @@ void setStatusLedWarning() {
 
 void setStatusLedError() {
   setStatusLed(255, 0, 0);
+}
+
+// ============================================================================
+//  Persistencia de ajustes en NVS (flash)
+// ============================================================================
+//  Guarda los valores tuneados desde la web para que sobrevivan al reinicio.
+//  Asi no hay que copiarlos a Config.h ni recompilar para conservar el ajuste.
+//  Config.h sigue siendo el default de fabrica si NVS esta vacio.
+
+constexpr char NVS_NAMESPACE[] = "robot";
+
+void loadSettings() {
+  // readOnly=true: si el namespace no existe todavia, begin() devuelve false
+  // y se mantienen los defaults de Config.h.
+  if (!prefs.begin(NVS_NAMESPACE, true)) {
+    return;
+  }
+  const bool hasData = prefs.isKey("kp");
+  if (hasData) {
+    settings.kp = prefs.getFloat("kp", settings.kp);
+    settings.ki = prefs.getFloat("ki", settings.ki);
+    settings.kd = prefs.getFloat("kd", settings.kd);
+    settings.balanceAngleDeg = prefs.getFloat("bal", settings.balanceAngleDeg);
+    settings.startAngleWindowDeg = prefs.getFloat("win", settings.startAngleWindowDeg);
+    settings.fallAngleDeg = prefs.getFloat("fall", settings.fallAngleDeg);
+    settings.complementaryAlpha = prefs.getFloat("alpha", settings.complementaryAlpha);
+    settings.minAbsSpeed = prefs.getInt("minpwm", settings.minAbsSpeed);
+    settings.leftSpeedFactor = prefs.getFloat("lfac", settings.leftSpeedFactor);
+    settings.rightSpeedFactor = prefs.getFloat("rfac", settings.rightSpeedFactor);
+    settings.leftPwmTrim = prefs.getInt("ltrim", settings.leftPwmTrim);
+    settings.rightPwmTrim = prefs.getInt("rtrim", settings.rightPwmTrim);
+    settings.invertPitch = prefs.getBool("invp", settings.invertPitch);
+  }
+  prefs.end();
+  nvsHasSavedSettings = hasData;
+}
+
+// La escritura a flash congela la CPU unos ms: la ejecuta la task de control
+// y solo despues de desarmar, asi el robot no esta balanceando durante el commit.
+bool saveSettings() {
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    return false;
+  }
+  prefs.putFloat("kp", settings.kp);
+  prefs.putFloat("ki", settings.ki);
+  prefs.putFloat("kd", settings.kd);
+  prefs.putFloat("bal", settings.balanceAngleDeg);
+  prefs.putFloat("win", settings.startAngleWindowDeg);
+  prefs.putFloat("fall", settings.fallAngleDeg);
+  prefs.putFloat("alpha", settings.complementaryAlpha);
+  prefs.putInt("minpwm", settings.minAbsSpeed);
+  prefs.putFloat("lfac", settings.leftSpeedFactor);
+  prefs.putFloat("rfac", settings.rightSpeedFactor);
+  prefs.putInt("ltrim", settings.leftPwmTrim);
+  prefs.putInt("rtrim", settings.rightPwmTrim);
+  prefs.putBool("invp", settings.invertPitch);
+  prefs.end();
+  nvsHasSavedSettings = true;
+  return true;
 }
 
 const char INDEX_HTML[] PROGMEM = R"html(
@@ -565,6 +710,14 @@ const char INDEX_HTML[] PROGMEM = R"html(
       font-variant-numeric: tabular-nums;
       font-weight: 800;
     }
+    .chart {
+      width: 100%;
+      height: 160px;
+      display: block;
+      border: 1px solid #d5dde8;
+      border-radius: 8px;
+      background: #ffffff;
+    }
     .actions {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -611,14 +764,24 @@ const char INDEX_HTML[] PROGMEM = R"html(
       <div class="tile"><span class="label">Gyro Y</span><span class="value" id="rate">--</span></div>
       <div class="tile"><span class="label">MPU</span><span class="value" id="mpuInfo">--</span></div>
       <div class="tile"><span class="label">WiFi</span><span class="value" id="wifi">--</span></div>
+      <div class="tile"><span class="label">RMS error</span><span class="value" id="rms">--</span></div>
+      <div class="tile"><span class="label">Filtro alpha</span><span class="value" id="alphaEff">--</span></div>
+      <div class="tile"><span class="label">Auto-trim</span><span class="value" id="autoTrim">--</span></div>
+      <div class="tile"><span class="label">Ajustes NVS</span><span class="value" id="saved">--</span></div>
     </div>
+
+    <section>
+      <h2>Pitch en vivo</h2>
+      <canvas id="chart" class="chart"></canvas>
+      <span class="label" id="chartInfo">--</span>
+    </section>
 
     <section>
       <h2>PID</h2>
       <div class="grid">
-        <label><span class="control-head"><span>KP</span><output data-output="kp">--</output></span><input type="range" min="0" max="100" step="1" data-key="kp"></label>
-        <label><span class="control-head"><span>KI</span><output data-output="ki">--</output></span><input type="range" min="0" max="300" step="5" data-key="ki"></label>
-        <label><span class="control-head"><span>KD</span><output data-output="kd">--</output></span><input type="range" min="0" max="20" step="0.5" data-key="kd"></label>
+        <label><span class="control-head"><span>KP</span><output data-output="kp">--</output></span><input type="range" min="0" max="80" step="0.5" data-key="kp"></label>
+        <label><span class="control-head"><span>KI</span><output data-output="ki">--</output></span><input type="range" min="0" max="100" step="0.5" data-key="ki"></label>
+        <label><span class="control-head"><span>KD</span><output data-output="kd">--</output></span><input type="range" min="0" max="30" step="0.1" data-key="kd"></label>
       </div>
     </section>
 
@@ -646,6 +809,7 @@ const char INDEX_HTML[] PROGMEM = R"html(
       <div class="actions">
         <button class="secondary" type="button" data-action="reset">Desarmar</button>
         <button type="button" data-action="calibrate">Calibrar gyro</button>
+        <button type="button" data-action="save">Guardar ajustes</button>
       </div>
     </section>
   </main>
@@ -653,6 +817,7 @@ const char INDEX_HTML[] PROGMEM = R"html(
   <script>
     const controls = Array.from(document.querySelectorAll('[data-key]'));
     const controlTimers = {};
+    let dirty = false;
 
     function fmt(value, digits = 1) {
       if (value === null || value === undefined) {
@@ -701,9 +866,14 @@ const char INDEX_HTML[] PROGMEM = R"html(
     }
 
     function render(data) {
-      const sensorState = data.mpuReady
-        ? (data.gyroCalibrated ? (data.armed ? 'ARMADO' : 'ESPERA') : 'CALIBRAR')
-        : (data.mpuAddressAcked ? 'ID NO SOPORTADO' : 'SIN MPU');
+      let sensorState;
+      if (data.calibrating) {
+        sensorState = 'CALIBRANDO';
+      } else if (data.mpuReady) {
+        sensorState = data.gyroCalibrated ? (data.armed ? 'ARMADO' : 'ESPERA') : 'CALIBRAR';
+      } else {
+        sensorState = data.mpuAddressAcked ? 'ID NO SOPORTADO' : 'SIN MPU';
+      }
       text('state', sensorState);
       text('pitch', fmt(data.pitch, 2) + ' deg');
       text('output', fmt(data.output, 1));
@@ -713,9 +883,86 @@ const char INDEX_HTML[] PROGMEM = R"html(
       text('rate', fmt(data.pitchRate, 1) + ' dps');
       text('mpuInfo', data.mpuAddressAcked ? hex(data.mpuAddress) + ' / ' + hex(data.mpuWhoAmI) : '--');
       text('wifi', data.ip || '--');
+      text('rms', fmt(data.rms, 2) + ' deg');
+      text('alphaEff', fmt(data.alphaEff, 3));
+      text('autoTrim', fmt(data.autoTrim, 2) + ' deg');
+      text('saved', dirty ? 'cambios sin guardar' : (data.saved ? 'guardados' : 'sin guardar'));
 
       const settings = data.settings || {};
       Object.keys(settings).forEach((key) => setInput(key, settings[key]));
+    }
+
+    function drawChart(data) {
+      const canvas = document.getElementById('chart');
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      if (!w || !h) {
+        return;
+      }
+      if (canvas.width !== w) {
+        canvas.width = w;
+      }
+      if (canvas.height !== h) {
+        canvas.height = h;
+      }
+
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, w, h);
+
+      const pitch = data.pitch || [];
+      const setpoint = Number(data.setpoint) || 0;
+      if (pitch.length < 2) {
+        text('chartInfo', 'sin datos todavia');
+        return;
+      }
+
+      let maxDev = 3;
+      for (const p of pitch) {
+        const d = Math.abs(p - setpoint);
+        if (d > maxDev) {
+          maxDev = d;
+        }
+      }
+      const span = maxDev * 1.2;
+      const yMin = setpoint - span;
+      const yMax = setpoint + span;
+      const yOf = (v) => h - ((v - yMin) / (yMax - yMin)) * h;
+      const xOf = (i) => (i / (pitch.length - 1)) * w;
+
+      ctx.strokeStyle = '#94a3b8';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, yOf(setpoint));
+      ctx.lineTo(w, yOf(setpoint));
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.strokeStyle = '#2563eb';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      pitch.forEach((p, i) => {
+        const x = xOf(i);
+        const y = yOf(p);
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      ctx.stroke();
+
+      const windowS = (pitch.length / (Number(data.hz) || 50)).toFixed(1);
+      text('chartInfo', 'ventana ' + windowS + ' s | escala ' +
+        yMin.toFixed(1) + ' a ' + yMax.toFixed(1) + ' deg (linea = setpoint)');
+    }
+
+    async function refreshChart() {
+      try {
+        drawChart(await api('/samples'));
+      } catch (error) {
+        text('chartInfo', 'sin conexion');
+      }
     }
 
     async function refresh() {
@@ -728,6 +975,7 @@ const char INDEX_HTML[] PROGMEM = R"html(
 
     async function sendControl(input) {
       const value = input.type === 'checkbox' ? (input.checked ? 1 : 0) : input.value;
+      dirty = true;
       try {
         render(await api('/set?key=' + encodeURIComponent(input.dataset.key) + '&value=' + encodeURIComponent(value)));
       } catch (error) {
@@ -758,6 +1006,9 @@ const char INDEX_HTML[] PROGMEM = R"html(
         button.disabled = true;
         try {
           render(await api('/action?name=' + encodeURIComponent(button.dataset.action)));
+          if (button.dataset.action === 'save') {
+            dirty = false;
+          }
         } catch (error) {
           alert(error.message);
         }
@@ -767,6 +1018,8 @@ const char INDEX_HTML[] PROGMEM = R"html(
 
     refresh();
     setInterval(refresh, 600);
+    refreshChart();
+    setInterval(refreshChart, 500);
   </script>
 </body>
 </html>
@@ -801,6 +1054,9 @@ void updateArming(float angleDeg) {
   if (!armed && millis() - armStartMs >= Config::ARM_STABLE_TIME_MS) {
     armed = true;
     pid.reset();
+    // El RMS arranca de cero en cada sesion armada para medir este ajuste.
+    pitchErrorMsAccum = 0.0f;
+    pitchRmsDeg = 0.0f;
     Serial.println(F("Control activado."));
   }
 }
@@ -822,12 +1078,34 @@ bool updatePitch(float dtSeconds) {
     gyroRate = -gyroRate;
   }
 
+  // Velocidad suavizada para el termino D (la integracion del filtro de abajo
+  // sigue usando gyroRate crudo para no agregarle lag al angulo).
+  if (!filterInitialized) {
+    pitchRateFilteredDps = gyroRate;
+  } else {
+    pitchRateFilteredDps = Config::D_TERM_SMOOTHING * pitchRateFilteredDps +
+                           (1.0f - Config::D_TERM_SMOOTHING) * gyroRate;
+  }
+
   if (!filterInitialized) {
     pitchDeg = accelPitch;
     filterInitialized = true;
+    lastFilterAlpha = settings.complementaryAlpha;
   } else {
-    pitchDeg = settings.complementaryAlpha * (pitchDeg + gyroRate * dtSeconds) +
-               (1.0f - settings.complementaryAlpha) * accelPitch;
+    // Filtro complementario adaptativo: cuando el modulo del vector aceleracion
+    // se aparta de 1 g, el accel esta contaminado por aceleracion lineal, asi
+    // que subimos alpha para apoyarnos mas en el gyro durante esa muestra.
+    const float deviation = fabsf(mpu.accelMagnitudeG() - 1.0f);
+    float distrust = (deviation - Config::ACCEL_TRUST_DEV_LOW_G) /
+                     (Config::ACCEL_TRUST_DEV_HIGH_G - Config::ACCEL_TRUST_DEV_LOW_G);
+    distrust = constrain(distrust, 0.0f, 1.0f);
+
+    const float baseAlpha = settings.complementaryAlpha;
+    const float alpha = baseAlpha + (1.0f - baseAlpha) * distrust;
+    lastFilterAlpha = alpha;
+
+    pitchDeg = alpha * (pitchDeg + gyroRate * dtSeconds) +
+               (1.0f - alpha) * accelPitch;
   }
 
   pitchRateDps = gyroRate;
@@ -880,7 +1158,7 @@ bool parseBoolValue(String text, bool &value) {
 
 void sendStatus() {
   String json;
-  json.reserve(900);
+  json.reserve(1100);
 
   json += F("{\"armed\":");
   appendBool(json, armed);
@@ -896,6 +1174,8 @@ void sendStatus() {
   appendBool(json, mpu.supportedId());
   json += F(",\"gyroCalibrated\":");
   appendBool(json, gyroCalibrated);
+  json += F(",\"calibrating\":");
+  appendBool(json, calibrating);
   json += F(",\"ip\":\"");
   json += WiFi.softAPIP().toString();
   json += F("\",\"pitch\":");
@@ -912,6 +1192,14 @@ void sendStatus() {
   json += motors.rightPwm();
   json += F(",\"temp\":");
   appendFloat(json, mpuReady ? mpu.temperatureC() : NAN, 2);
+  json += F(",\"rms\":");
+  appendFloat(json, pitchRmsDeg, 3);
+  json += F(",\"alphaEff\":");
+  appendFloat(json, lastFilterAlpha, 4);
+  json += F(",\"autoTrim\":");
+  appendFloat(json, autoTrimDeg, 3);
+  json += F(",\"saved\":");
+  appendBool(json, nvsHasSavedSettings);
 
   json += F(",\"settings\":{\"kp\":");
   appendFloat(json, settings.kp, 4);
@@ -952,22 +1240,60 @@ void handleRoot() {
   server.send_P(200, PSTR("text/html"), INDEX_HTML);
 }
 
-bool calibrateGyroNow() {
+// Devuelve el buffer circular de pitch (orden cronologico) para el grafico web.
+void handleSamples() {
+  const uint16_t count = pitchSampleCount;
+  const uint16_t head = pitchSampleHead;
+  const uint16_t start = (head + PITCH_SAMPLE_CAP - count) % PITCH_SAMPLE_CAP;
+
+  String json;
+  json.reserve(static_cast<unsigned int>(count) * 8 + 96);
+  json += F("{\"setpoint\":");
+  appendFloat(json, settings.balanceAngleDeg + autoTrimDeg, 3);
+  json += F(",\"fallAngle\":");
+  appendFloat(json, settings.fallAngleDeg, 2);
+  json += F(",\"hz\":50,\"pitch\":[");
+  for (uint16_t i = 0; i < count; ++i) {
+    if (i != 0) {
+      json += ',';
+    }
+    json += String(pitchSamples[(start + i) % PITCH_SAMPLE_CAP], 2);
+  }
+  json += F("]}");
+
+  server.sendHeader(F("Cache-Control"), F("no-store"));
+  server.send(200, F("application/json"), json);
+}
+
+// Calibracion del gyro. La ejecuta SIEMPRE la task de control (nunca la task
+// del web server) para que no haya dos tareas tocando el bus I2C a la vez.
+bool runGyroCalibration() {
   resetArming();
+  calibrating = true;
+  setStatusLedCalibrating();
   if (!mpuReady) {
     mpuReady = mpu.begin();
   }
   if (!mpuReady) {
     gyroCalibrated = false;
+    calibrating = false;
     setStatusLedError();
     return false;
   }
 
-  Serial.println(F("Calibrando gyro desde web. Mantener el robot quieto..."));
+  Serial.println(F("Calibrando gyro. Mantener el robot quieto..."));
   gyroCalibrated = mpu.calibrateGyro();
   filterInitialized = false;
   lastControlUs = micros();
-  gyroCalibrated ? setStatusLedOk() : setStatusLedWarning();
+  lastFallenLed = false;
+  autoTrimDeg = 0.0f;
+  restSinceMs = 0;
+  calibrating = false;
+  if (gyroCalibrated) {
+    setStatusLedReady();
+  } else {
+    setStatusLedWarning();
+  }
 
   Serial.print(F("Bias gyro Y: "));
   Serial.println(mpu.gyroBiasY, 2);
@@ -999,17 +1325,18 @@ void handleWebSet() {
   }
 
   if (key == F("kp")) {
-    settings.kp = constrain(numericValue, 0.0f, 100.0f);
+    settings.kp = constrain(numericValue, 0.0f, 80.0f);
     pid.reset();
   } else if (key == F("ki")) {
-    settings.ki = constrain(numericValue, 0.0f, 300.0f);
+    settings.ki = constrain(numericValue, 0.0f, 200.0f);
     pid.reset();
   } else if (key == F("kd")) {
-    settings.kd = constrain(numericValue, 0.0f, 20.0f);
+    settings.kd = constrain(numericValue, 0.0f, 30.0f);
     pid.reset();
   } else if (key == F("balanceAngle")) {
     settings.balanceAngleDeg = constrain(numericValue, -90.0f, 90.0f);
     pid.reset();
+    autoTrimDeg = 0.0f;  // el auto-trim es relativo a este angulo base.
   } else if (key == F("startWindow")) {
     settings.startAngleWindowDeg = constrain(numericValue, 0.0f, 45.0f);
   } else if (key == F("fallAngle")) {
@@ -1035,6 +1362,7 @@ void handleWebSet() {
     settings.invertPitch = boolValue;
     resetFilter = true;
     stopControl = true;
+    autoTrimDeg = 0.0f;
   } else {
     server.send(400, F("text/plain"), F("Parametro invalido"));
     return;
@@ -1044,7 +1372,8 @@ void handleWebSet() {
     filterInitialized = false;
   }
   if (stopControl) {
-    resetArming();
+    // El desarmado real (parar motores) lo hace la task de control.
+    resetRequested = true;
   }
 
   sendStatus();
@@ -1056,14 +1385,20 @@ void handleWebAction() {
     return;
   }
 
+  // Las acciones que tocan motores o el bus I2C no se ejecutan aca: solo se
+  // dejan pedidas con una bandera y las atiende la task de control.
   const String action = server.arg("name");
   if (action == F("reset")) {
-    resetArming();
+    resetRequested = true;
   } else if (action == F("calibrate")) {
-    if (!calibrateGyroNow()) {
-      server.send(500, F("text/plain"), F("No se pudo calibrar el gyro"));
+    if (calibrating) {
+      server.send(409, F("text/plain"), F("Calibracion ya en curso"));
       return;
     }
+    calibrateRequested = true;
+  } else if (action == F("save")) {
+    // Guardar desarma el robot: la escritura a flash congela la CPU unos ms.
+    saveRequested = true;
   } else {
     server.send(400, F("text/plain"), F("Accion invalida"));
     return;
@@ -1088,6 +1423,7 @@ void setupWebServer() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, sendStatus);
+  server.on("/samples", HTTP_GET, handleSamples);
   server.on("/set", HTTP_GET, handleWebSet);
   server.on("/action", HTTP_GET, handleWebAction);
   server.onNotFound([]() {
@@ -1096,6 +1432,195 @@ void setupWebServer() {
   server.begin();
 
   Serial.println(F("Servidor HTTP iniciado."));
+}
+
+// ============================================================================
+//  Task de control - lazo de balanceo a 200 Hz
+// ============================================================================
+//  Corre en su propia task FreeRTOS con prioridad mayor que loop() (que solo
+//  atiende el servidor web). Asi una request HTTP lenta no puede retrasar un
+//  ciclo de control. El periodo lo marca vTaskDelayUntil (timing deterministico)
+//  y el dt real se mide con micros() para el filtro y el PID.
+
+// MPU sin detectar o gyro sin calibrar: motores parados y reintento de deteccion.
+void controlWaitStep() {
+  motors.stop();
+  lastOutput = 0.0f;
+
+  const uint32_t nowMs = millis();
+  if (!mpuReady && nowMs - lastMpuRetryMs >= Config::MPU_RETRY_PERIOD_MS) {
+    lastMpuRetryMs = nowMs;
+    mpuReady = mpu.begin();
+    if (mpuReady) {
+      filterInitialized = false;
+      Serial.print(F("MPU compatible detectado en reintento 0x"));
+      Serial.print(mpu.i2cAddress(), HEX);
+      Serial.print(F(" WHO_AM_I=0x"));
+      Serial.println(mpu.whoAmI(), HEX);
+      setStatusLedWarning();
+    }
+  }
+
+  if (nowMs - lastDebugMs >= Config::DEBUG_PERIOD_MS) {
+    lastDebugMs = nowMs;
+    if (mpuReady) {
+      Serial.println(F("Esperando calibracion del gyro."));
+    } else if (mpu.addressAcked()) {
+      Serial.print(F("Esperando MPU compatible. Ultimo ACK 0x"));
+      Serial.print(mpu.i2cAddress(), HEX);
+      Serial.print(F(" WHO_AM_I=0x"));
+      Serial.println(mpu.whoAmI(), HEX);
+    } else {
+      Serial.println(F("Esperando MPU compatible."));
+    }
+  }
+}
+
+// Un ciclo completo de balanceo: lee IMU, filtra, detecta caida y maneja motores.
+void controlStep() {
+  const uint32_t nowUs = micros();
+  float dtSeconds = static_cast<float>(nowUs - lastControlUs) / 1000000.0f;
+  if (dtSeconds > 0.02f) {
+    dtSeconds = 0.02f;
+  }
+  lastControlUs = nowUs;
+  if (Config::USE_MPU_INTERRUPT) {
+    mpuDataReady = false;
+  }
+
+  if (!updatePitch(dtSeconds)) {
+    resetArming();
+    mpuReady = false;
+    gyroCalibrated = false;
+    setStatusLedError();
+    Serial.println(F("Error leyendo MPU6050. Motores detenidos."));
+    return;
+  }
+
+  const bool fallen = fabsf(pitchDeg - settings.balanceAngleDeg) > settings.fallAngleDeg;
+  if (fallen) {
+    if (armed) {
+      Serial.println(F("Caida detectada. Control desactivado."));
+    }
+    resetArming();
+  }
+
+  if (fallen != lastFallenLed) {
+    lastFallenLed = fallen;
+    if (fallen) {
+      setStatusLedFallen();
+    } else {
+      setStatusLedReady();
+    }
+  }
+
+  // Setpoint efectivo = angulo base del usuario + correccion del auto-trim.
+  const float setpointEff = settings.balanceAngleDeg + autoTrimDeg;
+
+  if (armed) {
+    lastOutput = pid.compute(setpointEff, pitchDeg, pitchRateFilteredDps, dtSeconds, settings);
+    motors.drive(lastOutput, settings);
+
+    // RMS del error de pitch: promedio movil exponencial del error al cuadrado.
+    const float err = pitchDeg - setpointEff;
+    const float k = constrain(dtSeconds / Config::RMS_TAU_S, 0.0f, 1.0f);
+    pitchErrorMsAccum += (err * err - pitchErrorMsAccum) * k;
+    pitchRmsDeg = sqrtf(pitchErrorMsAccum);
+
+    // Auto-trim: integra MUY lento la salida del PID y corre el setpoint hacia
+    // el verdadero punto de equilibrio (donde el esfuerzo promedio tiende a 0).
+    // El signo es realimentacion negativa: si la salida es positiva sostenida,
+    // baja autoTrimDeg -> baja el setpoint -> baja el error -> baja la salida.
+    if (Config::AUTO_TRIM_ENABLED) {
+      autoTrimDeg -= Config::AUTO_TRIM_GAIN * lastOutput * dtSeconds;
+      autoTrimDeg = constrain(autoTrimDeg,
+                              -Config::AUTO_TRIM_LIMIT_DEG, Config::AUTO_TRIM_LIMIT_DEG);
+    }
+    restSinceMs = 0;
+  } else {
+    if (!fallen) {
+      updateArming(pitchDeg);
+    }
+    lastOutput = 0.0f;
+    motors.stop();
+
+    // Re-calibracion del bias del gyro: si el robot quedo quieto un rato,
+    // arrastramos el bias hacia la lectura cruda (compensa drift termico).
+    if (Config::REST_RECAL_ENABLED && mpu.looksAtRest()) {
+      const uint32_t restNow = millis();
+      if (restSinceMs == 0) {
+        restSinceMs = restNow;
+      } else if (restNow - restSinceMs >= Config::REST_RECAL_DELAY_MS) {
+        mpu.nudgeGyroBias(Config::REST_RECAL_GAIN);
+      }
+    } else {
+      restSinceMs = 0;
+    }
+  }
+
+  // Buffer circular para el grafico en vivo de la web: 1 muestra cada 4 ciclos.
+  if (++pitchSampleDivider >= 4) {
+    pitchSampleDivider = 0;
+    pitchSamples[pitchSampleHead] = pitchDeg;
+    pitchSampleHead = (pitchSampleHead + 1) % PITCH_SAMPLE_CAP;
+    if (pitchSampleCount < PITCH_SAMPLE_CAP) {
+      ++pitchSampleCount;
+    }
+  }
+
+  const uint32_t nowMs = millis();
+  if (nowMs - lastDebugMs >= Config::DEBUG_PERIOD_MS) {
+    lastDebugMs = nowMs;
+    // Formato del Serial Plotter del IDE de Arduino ("etiqueta:valor,...").
+    // Las tres series comparten escala en grados para que el grafico sea util.
+    Serial.print(F("pitch:"));
+    Serial.print(pitchDeg, 2);
+    Serial.print(F(",setpoint:"));
+    Serial.print(setpointEff, 2);
+    Serial.print(F(",rms:"));
+    Serial.println(pitchRmsDeg, 2);
+  }
+}
+
+void controlTask(void *param) {
+  (void)param;
+  const TickType_t period = pdMS_TO_TICKS(Config::CONTROL_PERIOD_US / 1000);
+  TickType_t lastWake = xTaskGetTickCount();
+  lastControlUs = micros();
+
+  for (;;) {
+    vTaskDelayUntil(&lastWake, period);
+
+    // Pedidos posteados por la task del servidor web.
+    if (resetRequested) {
+      resetRequested = false;
+      resetArming();
+    }
+    if (saveRequested) {
+      saveRequested = false;
+      // Desarmamos antes del commit: la escritura a flash congela la CPU unos
+      // ms y no queremos que pase mientras el robot esta balanceando.
+      resetArming();
+      Serial.println(saveSettings() ? F("Ajustes guardados en NVS.")
+                                    : F("Error guardando ajustes en NVS."));
+      lastWake = xTaskGetTickCount();
+      lastControlUs = micros();
+    }
+    if (calibrateRequested) {
+      calibrateRequested = false;
+      runGyroCalibration();
+      // La calibracion bloquea ~6 s: resincronizamos el reloj de la task para
+      // no disparar una rafaga de ciclos "atrasados" con vTaskDelayUntil.
+      lastWake = xTaskGetTickCount();
+      lastControlUs = micros();
+    }
+
+    if (!mpuReady || !gyroCalibrated) {
+      controlWaitStep();
+    } else {
+      controlStep();
+    }
+  }
 }
 
 // ============================================================================
@@ -1108,7 +1633,12 @@ void setup() {
 
   Serial.println();
   Serial.println(F("Robot balancin ESP32-C3"));
-  setStatusLedBooting();
+  setStatusLedCalibrating();
+
+  // Cargamos los ajustes guardados en NVS (si hay); si no, quedan los de Config.h.
+  loadSettings();
+  Serial.println(nvsHasSavedSettings ? F("Ajustes cargados desde NVS.")
+                                     : F("Sin ajustes en NVS: se usan los de Config.h."));
 
   Wire.begin(Config::I2C_SDA_PIN, Config::I2C_SCL_PIN, Config::I2C_CLOCK_HZ);
   Wire.setTimeOut(50);
@@ -1128,11 +1658,16 @@ void setup() {
     Serial.print(F(" WHO_AM_I=0x"));
     Serial.println(mpu.whoAmI(), HEX);
     Serial.println(F("Mantener el robot quieto para calibrar gyro..."));
+    setStatusLedCalibrating();
     gyroCalibrated = mpu.calibrateGyro();
     if (!gyroCalibrated) {
       Serial.println(F("Fallo la calibracion del gyro. Usar la web para reintentar."));
     }
-    gyroCalibrated ? setStatusLedOk() : setStatusLedWarning();
+    if (gyroCalibrated) {
+      setStatusLedReady();
+    } else {
+      setStatusLedWarning();
+    }
   } else {
     if (mpu.addressAcked()) {
       Serial.print(F("MPU con ACK en 0x"));
@@ -1149,107 +1684,16 @@ void setup() {
   Serial.println(mpu.gyroBiasY, 2);
   Serial.println(F("Colocar el robot cerca del equilibrio para activar el control."));
 
-  lastControlUs = micros();
+  // Lanzamos el lazo de balanceo en su propia task FreeRTOS, fijada al core 0
+  // (el unico del ESP32-C3) y con prioridad 2: por encima de loop() y de IDLE,
+  // por debajo de las tasks de sistema (WiFi/lwIP).
+  xTaskCreatePinnedToCore(controlTask, "control", 4096, nullptr, 2, &controlTaskHandle, 0);
+  Serial.println(F("Task de control iniciada."));
 }
 
 void loop() {
+  // loop() corre como task FreeRTOS de prioridad 1 y solo atiende el servidor
+  // web. La task de control (prioridad 2) la apropia cada ciclo de balanceo.
   server.handleClient();
-
-  if (!mpuReady || !gyroCalibrated) {
-    motors.stop();
-    lastOutput = 0.0f;
-    const uint32_t nowMs = millis();
-    if (!mpuReady && nowMs - lastMpuRetryMs >= Config::MPU_RETRY_PERIOD_MS) {
-      lastMpuRetryMs = nowMs;
-      mpuReady = mpu.begin();
-      if (mpuReady) {
-        filterInitialized = false;
-        Serial.print(F("MPU compatible detectado en reintento 0x"));
-        Serial.print(mpu.i2cAddress(), HEX);
-        Serial.print(F(" WHO_AM_I=0x"));
-        Serial.println(mpu.whoAmI(), HEX);
-        setStatusLedWarning();
-      }
-    }
-
-    if (nowMs - lastDebugMs >= Config::DEBUG_PERIOD_MS) {
-      lastDebugMs = nowMs;
-      if (mpuReady) {
-        Serial.println(F("Esperando calibracion del gyro."));
-      } else if (mpu.addressAcked()) {
-        Serial.print(F("Esperando MPU compatible. Ultimo ACK 0x"));
-        Serial.print(mpu.i2cAddress(), HEX);
-        Serial.print(F(" WHO_AM_I=0x"));
-        Serial.println(mpu.whoAmI(), HEX);
-      } else {
-        Serial.println(F("Esperando MPU compatible."));
-      }
-    }
-    delay(2);
-    return;
-  }
-
-  const uint32_t nowUs = micros();
-  if (static_cast<uint32_t>(nowUs - lastControlUs) < Config::CONTROL_PERIOD_US) {
-    // Cede CPU para que la tarea IDLE alimente el watchdog en C3 (single core).
-    delayMicroseconds(100);
-    return;
-  }
-
-  float dtSeconds = static_cast<float>(nowUs - lastControlUs) / 1000000.0f;
-  if (dtSeconds > 0.02f) {
-    dtSeconds = 0.02f;
-  }
-  lastControlUs = nowUs;
-  if (Config::USE_MPU_INTERRUPT) {
-    mpuDataReady = false;
-  }
-
-  if (!updatePitch(dtSeconds)) {
-    resetArming();
-    mpuReady = false;
-    gyroCalibrated = false;
-    setStatusLedError();
-    Serial.println(F("Error leyendo MPU6050. Motores detenidos."));
-    delay(2);
-    return;
-  }
-
-  const bool fallen = fabsf(pitchDeg - settings.balanceAngleDeg) > settings.fallAngleDeg;
-  if (fallen) {
-    if (armed) {
-      Serial.println(F("Caida detectada. Control desactivado."));
-    }
-    resetArming();
-  }
-
-  if (armed) {
-    lastOutput = pid.compute(settings.balanceAngleDeg, pitchDeg, pitchRateDps, dtSeconds, settings);
-    motors.drive(lastOutput, settings);
-  } else {
-    if (!fallen) {
-      updateArming(pitchDeg);
-    }
-    lastOutput = 0.0f;
-    motors.stop();
-  }
-
-  const uint32_t nowMs = millis();
-  if (nowMs - lastDebugMs >= Config::DEBUG_PERIOD_MS) {
-    lastDebugMs = nowMs;
-    Serial.print(F("Pitch: "));
-    Serial.print(pitchDeg, 2);
-    Serial.print(F(" | Setpoint: "));
-    Serial.print(settings.balanceAngleDeg, 2);
-    Serial.print(F(" | Output: "));
-    Serial.print(lastOutput, 1);
-    Serial.print(F(" | PWM L/R: "));
-    Serial.print(motors.leftPwm());
-    Serial.print(F("/"));
-    Serial.print(motors.rightPwm());
-    Serial.print(F(" | Estado: "));
-    Serial.print(armed ? F("ARMADO") : F("ESPERA"));
-    Serial.print(F(" | Temp: "));
-    Serial.println(mpu.temperatureC(), 1);
-  }
+  delay(2);
 }
